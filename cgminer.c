@@ -469,6 +469,30 @@ struct cgpu_info *get_devices(int id)
 	return cgpu;
 }
 
+
+/* Fast PRNG for making non-duplicate work orders
+ * 
+ * This is the fastest generator passing BigCrush without
+ * systematic failures, but due to the relatively short period it is
+ * acceptable only for applications with a mild amount of parallelism;
+ * otherwise, use a xorshift1024* generator.
+
+ * The state must be seeded so that it is not everywhere zero. If you have
+ * a 64-bit seed, we suggest to seed a splitmix64 generator and use its
+ * output to fill s. */
+
+uint64_t r_seed[2];
+
+/* TODO Mutex this so it can't race */
+uint64_t next(void) {
+	uint64_t s1 = r_seed[0];
+	const uint64_t s0 = r_seed[1];
+	r_seed[0] = s0;
+	s1 ^= s1 << 23; // a
+	r_seed[1] = s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5); // b, c
+	return r_seed[1] + s0; 
+}
+
 static void sharelog(const char*disposition, const struct work*work)
 {
 	char *target, *hash, *data;
@@ -2050,6 +2074,17 @@ static bool getwork_decode(json_t *res_val, struct work *work)
 		return false;
 	}
 
+    /* Give the work a random extra nonce each time we stage it. 
+	 * This is a hack designed to ensure that running multiple 
+	 * instances of cgminer with each different GPU all perform 
+	 * different work. */
+	uint32_t *data_cast_as_32;
+    data_cast_as_32 = (uint32_t*) work->data;
+    uint64_t r_uint64 = next();
+    data_cast_as_32[36] = (uint32_t)(r_uint64 >> 32);
+    data_cast_as_32[37] = (uint32_t)r_uint64;
+	applog(LOG_DEBUG, "per work extranonce %x %x", data_cast_as_32[36], data_cast_as_32[37]);
+	
 	/*
 	No midstate in DCR
 	if (!jobj_binary(res_val, "midstate", work->midstate, sizeof(work->midstate), false)) {
@@ -3570,6 +3605,14 @@ static struct work *make_clone(struct work *work)
 	/* Make cloned work appear slightly older to bias towards keeping the
 	 * master work item which can be further rolled */
 	work_clone->tv_staged.tv_sec -= 1;
+    
+    /* Give the cloned work a random extra nonce so it 
+     * doesn't repeat any work we've already done. */
+	uint32_t *data_cast_as_32;
+    data_cast_as_32 = (uint32_t*) work_clone->data;
+    uint64_t r_uint64 = next();
+    data_cast_as_32[36] = (uint32_t)(r_uint64 >> 32);
+    data_cast_as_32[37] = (uint32_t)r_uint64;
 
 	return work_clone;
 }
@@ -4299,7 +4342,7 @@ static bool hash_push(struct work *work)
 }
 
 static void stage_work(struct work *work)
-{
+{   
 	applog(LOG_DEBUG, "Pushing work from pool %d to hash queue", work->pool->pool_no);
 	work->work_block = work_block;
 	test_work_current(work);
@@ -8514,6 +8557,16 @@ begin_bench:
 	if (total_control_threads != 8)
 		quit(1, "incorrect total_control_threads (%d) should be 8", total_control_threads);
 
+	/* Seed the PRNG with the current timestamp and the device ID. */
+	r_seed[0] = (uint64_t)(time(0)^ 0x1234567887654321);
+	r_seed[1] = (uint64_t)(r_seed[0] ^ 0xFE2355661ECA99BC);
+	for (i = 0; i < MAX_DEVICES; i++) {
+		if (devices_enabled[i]) {
+			r_seed[0] += (uint64_t)i;
+			break;
+		}
+	}
+	
 	/* Once everything is set up, main() becomes the getwork scheduler */
 	while (42) {
 		int ts, max_staged = opt_queue;
