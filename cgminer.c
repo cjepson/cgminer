@@ -3681,7 +3681,7 @@ static void _copy_work(struct work *work, const struct work *base_work, int noff
 		/* If we are passed an noffset the binary work->data ntime and
 		 * the work->ntime hex string need to be adjusted. */
 		if (noffset) {
-			uint32_t *work_ntime = (uint32_t *)(work->data + 68);
+			uint32_t *work_ntime = (uint32_t *)(work->data + 136);
 			uint32_t ntime = be32toh(*work_ntime);
 
 			ntime += noffset;
@@ -3690,7 +3690,7 @@ static void _copy_work(struct work *work, const struct work *base_work, int noff
 		} else
 			work->ntime = strdup(base_work->ntime);
 	} else if (noffset) {
-		uint32_t *work_ntime = (uint32_t *)(work->data + 68);
+		uint32_t *work_ntime = (uint32_t *)(work->data + 136);
 		uint32_t ntime = be32toh(*work_ntime);
 
 		ntime += noffset;
