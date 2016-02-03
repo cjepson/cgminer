@@ -547,8 +547,8 @@ struct cgpu_info *get_devices(int id)
  * output to fill s. */
 
 uint64_t r_seed[2];
+pthread_mutex_t xor_prng_lock;
 
-/* TODO Mutex this so it can't race */
 uint64_t next(void) {
 	uint64_t s1 = r_seed[0];
 	const uint64_t s0 = r_seed[1];
@@ -3111,6 +3111,9 @@ static bool get_upstream_work(struct work *work, CURL *curl)
 	work->pool = pool;
 	work->longpoll = false;
 	work->getwork_mode = GETWORK_MODE_POOL;
+	uint32_t* data_cast_as_32 = (uint32_t*) work->data;
+	uint32_t timestamp = data_cast_as_32[34];
+	memcpy(&work->ntime, &timestamp, 4);
 	calc_diff(work, 0);
 	total_getworks++;
 	pool->getwork_requested++;
@@ -3618,7 +3621,7 @@ static void roll_work(struct work *work)
 	uint32_t ntime;
 
 	work_ntime = (uint32_t *)(work->data + 136);
-	ntime = be32toh(*work_ntime);
+	ntime = *work_ntime;
 	ntime++;
 	*work_ntime = htobe32(ntime);
 	local_work++;
@@ -3763,20 +3766,6 @@ static void *submit_work_thread(void __maybe_unused *userdata)
 }
 #endif /* HAVE_LIBCURL */
 
-/* Return an adjusted ntime if we're submitting work that a device has
- * internally offset the ntime. */
-static char *offset_ntime(const char *ntime, int noffset)
-{
-	unsigned char bin[4];
-	uint32_t h32, *be32 = (uint32_t *)bin;
-
-	hex2bin(bin, ntime, 4);
-	h32 = be32toh(*be32) + noffset;
-	*be32 = htobe32(h32);
-
-	return bin2hex(bin, 4);
-}
-
 /* Duplicates any dynamically allocated arrays within the work struct to
  * prevent a copied work struct from freeing ram belonging to another struct */
 static void _copy_work(struct work *work, const struct work *base_work, int noffset)
@@ -3798,15 +3787,23 @@ static void _copy_work(struct work *work, const struct work *base_work, int noff
 		if (noffset) {
 			uint32_t *work_ntime = (uint32_t *)(work->data + 136);
 			uint32_t ntime = be32toh(*work_ntime);
-
-			ntime += noffset;
-			*work_ntime = htobe32(ntime);
+			uint32_t ntime = *work_ntime;
+		
+			ntime += noffset;					ntime += noffset;
+			*work_ntime = htobe32(ntime);					
+            *work_ntime = htobe32(ntime);
 			work->ntime = offset_ntime(base_work->ntime, noffset);
+						
+			// Copy this timestamp too.
+			uint32_t ts;
+			memcpy(&ts, &base_work->ntime, 4);
+			ts += noffset;
+			memcpy(&work->ntime, &ts, 4);
 		} else
 			work->ntime = strdup(base_work->ntime);
 	} else if (noffset) {
 		uint32_t *work_ntime = (uint32_t *)(work->data + 136);
-		uint32_t ntime = be32toh(*work_ntime);
+		uint32_t ntime = *work_ntime;
 
 		ntime += noffset;
 		*work_ntime = htobe32(ntime);
@@ -6279,8 +6276,11 @@ struct work *get_work(struct thr_info *thr, const int thr_id)
 	}
 	applog(LOG_DEBUG, "Got work from get queue to get work for thread %d", thr_id);
 	
-	/* Assign a random extra nonce to this work that we've just popped off. */
+	/* Assign a random unique ID to this work that we've just popped off. */
+	mutex_lock(&xor_prng_lock);
 	uint64_t r_uint64 = next();
+	mutex_unlock(&xor_prng_lock);
+	applog(LOG_DEBUG, "Assigning unique work ID %x, %x", (uint32_t)(r_uint64 >> 32), (uint32_t)r_uint64);
 	data_cast_as_32[36] = (uint32_t)(r_uint64 >> 32);
 	data_cast_as_32[37] = (uint32_t)r_uint64;
 
@@ -6587,13 +6587,7 @@ static void hash_sole_work(struct thr_info *mythr)
 			 * it is not in the driver code. */
 			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 			
-			// Increment the third extranonce with every call.
-			//uint32_t *data_cast_as_32;
-			//data_cast_as_32 = (uint32_t*) work->data;
-			//data_cast_as_32[38]++;
-			
 			thread_reportin(mythr);
-			// applog(LOG_DEBUG, "Begin sole work scanhash for merkle root %x, extra_nonce %x %x %x %x", data_cast_as_32[9], data_cast_as_32[36], data_cast_as_32[37], data_cast_as_32[38], data_cast_as_32[39]);
 			hashes = drv->scanhash(mythr, work, work->blk.nonce + max_nonce);
 			thread_reportout(mythr);
 
@@ -8254,6 +8248,9 @@ int main(int argc, char *argv[])
 	rwlock_init(&mining_thr_lock);
 	rwlock_init(&devices_lock);
 
+	if (unlikely(pthread_mutex_init(&xor_prng_lock, NULL)))
+		quit(1, "Failed to pthread_mutex_init xor_prng_lock");
+
 	mutex_init(&lp_lock);
 	if (unlikely(pthread_cond_init(&lp_cond, NULL)))
 		quit(1, "Failed to pthread_cond_init lp_cond");
@@ -8669,6 +8666,7 @@ begin_bench:
 	/* Seed the PRNG with the some random bytes and the device ID. */
 	unsigned char rand_bytes_8[8];
 	randombytes(rand_bytes_8, 8);
+	mutex_lock(&xor_prng_lock);
 	r_seed[0] = ((uint64_t)rand_bytes_8[0])<<(8*7) 
 				 | ((uint64_t) rand_bytes_8[1])<<(8*6)
                  | ((uint64_t) rand_bytes_8[2])<<(8*5)
@@ -8684,6 +8682,7 @@ begin_bench:
 			break;
 		}
 	}
+	mutex_unlock(&xor_prng_lock);
 	applog(LOG_DEBUG, "PRNG initialized with seed [%016llX,%016llX]", r_seed[0], r_seed[1]);
 	
 	/* Once everything is set up, main() becomes the getwork scheduler */
