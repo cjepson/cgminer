@@ -3786,13 +3786,9 @@ static void _copy_work(struct work *work, const struct work *base_work, int noff
 		 * the work->ntime hex string need to be adjusted. */
 		if (noffset) {
 			uint32_t *work_ntime = (uint32_t *)(work->data + 136);
-			uint32_t ntime = be32toh(*work_ntime);
 			uint32_t ntime = *work_ntime;
-		
-			ntime += noffset;					ntime += noffset;
+			ntime += noffset;
 			*work_ntime = htobe32(ntime);					
-            *work_ntime = htobe32(ntime);
-			work->ntime = offset_ntime(base_work->ntime, noffset);
 						
 			// Copy this timestamp too.
 			uint32_t ts;
